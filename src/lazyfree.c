@@ -23,8 +23,8 @@ void lazyfreeFreeObject(void *args[]) {
 void lazyfreeFreeDatabase(void *args[]) {
     kvstore *da1 = args[0];
     kvstore *da2 = args[1];
-    estore *subexpires = args[2];
-    estoreRelease(subexpires);
+    ebuckets oldHfe = args[2];
+    ebDestroy(&oldHfe, &hashExpireBucketsType, NULL);
     size_t numkeys = kvstoreSize(da1);
     kvstoreRelease(da1);
     kvstoreRelease(da2);
@@ -206,12 +206,12 @@ void emptyDbAsync(redisDb *db) {
         flags |= KVSTORE_FREE_EMPTY_DICTS;
     }
     kvstore *oldkeys = db->keys, *oldexpires = db->expires;
-    estore *oldsubexpires = db->subexpires;
+    ebuckets oldHfe = db->hexpires;
     db->keys = kvstoreCreate(&dbDictType, slot_count_bits, flags | KVSTORE_ALLOC_META_KEYS_HIST);
     db->expires = kvstoreCreate(&dbExpiresDictType, slot_count_bits, flags);
-    db->subexpires = estoreCreate(&subexpiresBucketsType, slot_count_bits);
+    db->hexpires = ebCreate();
     atomicIncr(lazyfree_objects, kvstoreSize(oldkeys));
-    bioCreateLazyFreeJob(lazyfreeFreeDatabase, 3, oldkeys, oldexpires, oldsubexpires);
+    bioCreateLazyFreeJob(lazyfreeFreeDatabase, 3, oldkeys, oldexpires, oldHfe);
 }
 
 /* Free the key tracking table.
