@@ -141,11 +141,12 @@ typedef struct {
  * pointers are worthwhile moving and which aren't */
 int je_get_defrag_hint(void* ptr);
 
-/* Defrag helper for generic allocations without freeing old pointer.
+/* Defrag helper for generic allocations.
  *
- * Note: The caller is responsible for freeing the old pointer if this function
- * returns a non-NULL value. */
-void* activeDefragAllocWithoutFree(void *ptr) {
+ * returns NULL in case the allocation wasn't moved.
+ * when it returns a non-null value, the old pointer was already released
+ * and should NOT be accessed. */
+void* activeDefragAlloc(void *ptr) {
     size_t size;
     void *newptr;
     if(!je_get_defrag_hint(ptr)) {
@@ -158,23 +159,8 @@ void* activeDefragAllocWithoutFree(void *ptr) {
     size = zmalloc_usable_size(ptr);
     newptr = zmalloc_no_tcache(size);
     memcpy(newptr, ptr, size);
-    server.stat_active_defrag_hits++;
-    return newptr;
-}
-
-void activeDefragFree(void *ptr) {
     zfree_no_tcache(ptr);
-}
-
-/* Defrag helper for generic allocations.
- *
- * returns NULL in case the allocation wasn't moved.
- * when it returns a non-null value, the old pointer was already released
- * and should NOT be accessed. */
-void* activeDefragAlloc(void *ptr) {
-    void *newptr = activeDefragAllocWithoutFree(ptr);
-    if (newptr)
-        activeDefragFree(ptr);
+    server.stat_active_defrag_hits++;
     return newptr;
 }
 
@@ -185,7 +171,7 @@ void *activeDefragAllocRaw(size_t size) {
 
 /* Raw memory free for defrag, avoid using tcache. */
 void activeDefragFreeRaw(void *ptr) {
-    activeDefragFree(ptr);
+    zfree_no_tcache(ptr);
     server.stat_active_defrag_hits++;
 }
 
@@ -839,7 +825,6 @@ void* defragStreamConsumerPendingEntry(raxIterator *ri, void *privdata) {
     PendingEntryContext *ctx = privdata;
     streamNACK *nack = ri->data, *newnack;
     nack->consumer = ctx->c; /* update nack pointer to consumer */
-    nack->cgroup_ref_node->value = ctx->cg; /* Update the value of cgroups_ref node to the consumer group. */
     newnack = activeDefragAlloc(nack);
     if (newnack) {
         /* update consumer group pointer to the nack */
@@ -868,15 +853,13 @@ void* defragStreamConsumer(raxIterator *ri, void *privdata) {
 }
 
 void* defragStreamConsumerGroup(raxIterator *ri, void *privdata) {
-    streamCG *newcg, *cg = ri->data;
+    streamCG *cg = ri->data;
     UNUSED(privdata);
-    if ((newcg = activeDefragAlloc(cg)))
-        cg = newcg;
     if (cg->consumers)
         defragRadixTree(&cg->consumers, 0, defragStreamConsumer, cg);
     if (cg->pel)
         defragRadixTree(&cg->pel, 0, NULL, NULL);
-    return cg;
+    return NULL;
 }
 
 void defragStream(defragKeysCtx *ctx, kvobj *ob) {
@@ -896,7 +879,7 @@ void defragStream(defragKeysCtx *ctx, kvobj *ob) {
         defragRadixTree(&s->rax, 1, NULL, NULL);
 
     if (s->cgroups)
-        defragRadixTree(&s->cgroups, 0, defragStreamConsumerGroup, NULL);
+        defragRadixTree(&s->cgroups, 1, defragStreamConsumerGroup, NULL);
 }
 
 /* Defrag a module key. This is either done immediately or scheduled
@@ -1292,7 +1275,7 @@ static doneStatus defragStageExpiresKvstore(void *ctx, monotime endtime) {
 void *activeDefragHExpiresOB(void *ptr, void *privdata) {
     redisDb *db = privdata;
     dictEntryLink link, exlink = NULL;
-    kvobj *newkv, *kvobj = ptr;
+    kvobj *kvobj = ptr;
     sds keystr = kvobjGetKey(kvobj);
     unsigned int slot = calculateKeySlot(keystr);
     serverAssert(kvobj->type == OBJ_HASH);
@@ -1306,16 +1289,15 @@ void *activeDefragHExpiresOB(void *ptr, void *privdata) {
         serverAssert(exlink != NULL);
     }
 
-    if ((newkv = activeDefragAllocWithoutFree(kvobj))) {
+    if ((kvobj = activeDefragAlloc(kvobj))) {
         /* Update its reference in the DB keys. */
         link = kvstoreDictFindLink(db->keys, slot, keystr, NULL);
         serverAssert(link != NULL);
-        kvstoreDictSetAtLink(db->keys, slot, newkv, &link, 0);
+        kvstoreDictSetAtLink(db->keys, slot, kvobj, &link, 0);
         if (expire != -1)
-            kvstoreDictSetAtLink(db->expires, slot, newkv, &exlink, 0);
-        activeDefragFree(kvobj);
+            kvstoreDictSetAtLink(db->expires, slot, kvobj, &exlink, 0);
     }
-    return newkv;
+    return kvobj;
 }
 
 static doneStatus defragStageHExpires(void *ctx, monotime endtime) {
